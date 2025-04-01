@@ -1,31 +1,166 @@
 from .gee_interface import initialize_gee
 import ee
 
-def get_ndvi(point, start_date, end_date):
+def qaMask(image, cloud_threshold=2, cloudshadow_threshold=2, snow_threshold=2):
+    qa = image.select('QA_PIXEL')
+    cloud = qa.bitwiseAnd(1 << 3).And(qa.bitwiseAnd(3 << 8).gte(cloud_threshold))
+    cloudShadow = qa.bitwiseAnd(1 << 4).And(qa.bitwiseAnd(3 << 10).gte(cloudshadow_threshold))
+    snow = qa.bitwiseAnd(1 << 5).And(qa.bitwiseAnd(3 << 12).gte(snow_threshold))
+    mask = cloud.Or(cloudShadow).Or(snow).Not()
+    return image.updateMask(mask)
+
+def applyScaleFactors(image, scale_factors=None):
+    if scale_factors is None:
+        # Default scaling factors for SR_B4 and SR_B5.
+        scale_factors = {'SR_B4': (0.0000275, -0.2), 'SR_B5': (0.0000275, -0.2)}
+    for band, (mult, add) in scale_factors.items():
+        scaled = image.select(band).multiply(mult).add(add)
+        image = image.addBands(scaled.rename(band), overwrite=True)
+    return image
+
+def harmonization2OLI(image, slopes=None, offsets=None):
+    if slopes is None:
+        slopes = {'red': 0.9825, 'nir': 1.0073}
+    if offsets is None:
+        offsets = {'red': -0.0022, 'nir': -0.0021}
+    red_band = image.select('SR_B3')  # Red for Landsat 5/7
+    nir_band = image.select('SR_B4')  # NIR for Landsat 5/7
+    red_adjusted = red_band.multiply(slopes['red']).add(offsets['red'])
+    nir_adjusted = nir_band.multiply(slopes['nir']).add(offsets['nir'])
+    image = image.addBands(red_adjusted.rename('SR_B4'), overwrite=True)
+    image = image.addBands(nir_adjusted.rename('SR_B5'), overwrite=True)
+    return image
+
+def calculateNDVI(image):
+    # Compute NDVI using the adjusted NIR and Red bands.
+    ndvi = image.normalizedDifference(['SR_B5', 'SR_B4'])
+    return image.select([]).addBands(ndvi.rename('NDVI'))
+
+def getImageCollection(feature,
+                       use_landsat5=True, use_landsat7=True,
+                       use_landsat8=True, use_landsat9=True,
+                       cloud_threshold=2, cloudshadow_threshold=2, snow_threshold=2,
+                       scale_factors=None, slopes=None, offsets=None):
     """
-    Returns the NDVI for a given point and date range.
-    
+    Retrieves a merged Landsat image collection based on the specified options.
+
     Parameters:
-        point (tuple): A tuple containing the latitude and longitude of the point.
-        start_date (str): The start date of the date range in the format 'YYYY-MM-DD'.
-        end_date (str): The end date of the date range in the format 'YYYY-MM-DD'.
-        
+        feature (ee.Feature): contains point as aoi, start_date and end_date.
+        use_landsat5 (bool): Include Landsat 5 collection (default True).
+        use_landsat7 (bool): Include Landsat 7 collection (default True).
+        use_landsat8 (bool): Include Landsat 8 collection (default True).
+        use_landsat9 (bool): Include Landsat 9 collection (default True).
+        cloud_threshold (int): Confidence threshold for clouds (default 2).
+        cloudshadow_threshold (int): Confidence threshold for cloud shadows (default 2).
+        snow_threshold (int): Confidence threshold for snow (default 2).
+        scale_factors (dict): Optional dictionary for scaling factors. Example:
+            {'SR_B4': (multiply, add), 'SR_B5': (multiply, add)}.
+        slopes (dict): Optional dictionary for harmonization slopes. Example:
+            {'red': value, 'nir': value}.
+        offsets (dict): Optional dictionary for harmonization offsets. Example:
+            {'red': value, 'nir': value}.
+
     Returns:
-        NDVI value
+        ee.ImageCollection: Merged image collection (may be empty if no images match).
     """
-    # Initialize the Google Earth Engine API
-    initialize_gee()
+    aoi = feature.geometry()  # Get the geometry for filtering.
+    start = feature.get('start_date') # ee.Date(start_date)
+    end = feature.get('end_date') # ee.Date(end_date)
     
-    # Create a point geometry
-    point = ee.Geometry.Point(point)
+    collections = []
     
-    # Load the Landsat 8 surface reflectance data
-    collection = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+    if use_landsat8:
+        lc8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2') \
+            .filterDate(start, end) \
+            .filterBounds(aoi) \
+            .map(lambda image: qaMask(image, cloud_threshold, cloudshadow_threshold, snow_threshold)) \
+            .map(lambda image: applyScaleFactors(image, scale_factors)) \
+            .map(calculateNDVI)
+        collections.append(lc8)
     
-    # Filter the collection by date and location
-    filtered = collection.filterDate(start_date, end_date).filterBounds(point)
+    if use_landsat9:
+        lc9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2') \
+            .filterDate(start, end) \
+            .filterBounds(aoi) \
+            .map(lambda image: qaMask(image, cloud_threshold, cloudshadow_threshold, snow_threshold)) \
+            .map(lambda image: applyScaleFactors(image, scale_factors)) \
+            .map(calculateNDVI)
+        collections.append(lc9)
     
-    # Calculate the NDVI
-    ndvi = filtered.map(lambda image: image.normalizedDifference(['B5', 'B4'])).mean()
+    if use_landsat7:
+        le7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2') \
+            .filterDate(start, end) \
+            .filterBounds(aoi) \
+            .map(lambda image: qaMask(image, cloud_threshold, cloudshadow_threshold, snow_threshold)) \
+            .map(lambda image: harmonization2OLI(image, slopes, offsets)) \
+            .map(lambda image: applyScaleFactors(image, scale_factors)) \
+            .map(calculateNDVI)
+        collections.append(le7)
     
-    return ndvi
+    if use_landsat5:
+        lt5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2') \
+            .filterDate(start, end) \
+            .filterBounds(aoi) \
+            .map(lambda image: qaMask(image, cloud_threshold, cloudshadow_threshold, snow_threshold)) \
+            .map(lambda image: harmonization2OLI(image, slopes, offsets)) \
+            .map(lambda image: applyScaleFactors(image, scale_factors)) \
+            .map(calculateNDVI)
+        collections.append(lt5)
+    
+    if collections:
+        mergedCollection = collections[0]
+        for col in collections[1:]:
+            mergedCollection = mergedCollection.merge(col)
+    else:
+        # Return an empty ImageCollection if no sensors are selected.
+        mergedCollection = ee.ImageCollection([])
+    
+    return mergedCollection
+
+def get_ndvi(point, start_date, end_date):
+    
+    geometry = point
+
+    feature = ee.Feature(geometry, {'start_date': start_date, 'end_date': end_date})
+
+    def process_image(img):
+
+        combined_reducer = ee.Reducer.mean().combine(
+            reducer2=ee.Reducer.sum(),
+            sharedInputs=True
+        ).combine(
+            reducer2=ee.Reducer.count(),
+            sharedInputs=True
+        )
+
+        combined_results = img.reduceRegion(
+            reducer=combined_reducer,
+            geometry=geometry,
+            scale=30,
+            maxPixels=1e9,
+            bestEffort=True
+        )
+
+        ndvimean_value = combined_results.get('NDVI_mean')
+        ndvisum_value = combined_results.get('NDVI_sum')
+        ndvicount_value = combined_results.get('NDVI_count')
+
+        properties = ee.Dictionary.fromLists(
+            ['landsat_mean', 'landsat_sum', 'landsat_count'],
+            [ndvimean_value, ndvisum_value, ndvicount_value]
+        )
+        return feature.setMulti(properties)
+
+    ndvi_collection = getImageCollection(feature=feature).mean()
+    
+    has_bands_condition = ndvi_collection.bandNames().length().eq(0)
+
+    result_feature = ee.Feature(ee.Algorithms.If(
+        has_bands_condition,
+        feature,
+        process_image(ndvi_collection)
+    ))
+
+    return ee.Feature(None, result_feature.toDictionary())
+    
+

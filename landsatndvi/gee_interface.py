@@ -21,17 +21,55 @@ def initialize_gee(project, opt_url="https://earthengine-highvolume.googleapis.c
         ) from e
     
 def getTaskStatus():
+    """
+    Retrieves the status of tasks from Google Earth Engine,
+    orders them by a custom state order (RUNNING, then PENDING, then others)
+    and by submission time (earliest first).
+    
+    Returns:
+        tasks_df (pd.DataFrame): DataFrame containing task details.
+    """
     tasks = ee.data.listOperations()
     tasks_list = []
     for task in tasks:
-        if 'description' in task['metadata']:
-            description = task['metadata']['description']
-            state = task['metadata']['state']
+        metadata = task.get('metadata', {})
+        if 'description' in metadata:
+            description = metadata['description']
+            state = metadata['state']
+            # Attempt to retrieve a creation/submission time; assume 'createTime' exists.
+            create_time = metadata.get('createTime', None)
             tasks_list.append({
                 'name': task['name'],
                 'description': description,
-                'state': state
+                'state': state,
+                'createTime': create_time
             })
+    
     tasks_df = pd.DataFrame(tasks_list)
+    
+    # Define custom ordering for state: RUNNING first, then PENDING, then all others.
+    def state_sort_val(s):
+        if s == "RUNNING":
+            return 0
+        elif s == "PENDING":
+            return 1
+        else:
+            return 2
+
+    tasks_df['state_sort'] = tasks_df['state'].apply(state_sort_val)
+    
+    # If createTime exists, convert to datetime for proper sorting.
+    if tasks_df['createTime'].notnull().any():
+        tasks_df['createTime'] = pd.to_datetime(tasks_df['createTime'], errors='coerce')
+    
+    # Sort by state (custom order) and then by createTime (ascending, so earliest first)
+    tasks_df = tasks_df.sort_values(by=['state_sort', 'createTime'], ascending=[True, True])
+    
+    # Drop the temporary sort column.
+    tasks_df = tasks_df.drop(columns=['state_sort'])
+
+    # Format: "10:33:00 PM Mar 13"
+    tasks_df['createTime'] = tasks_df['createTime'].dt.strftime("%I:%M:%S %p %b %d")
+    
     print(tasks_df['state'].value_counts())
     return tasks_df
