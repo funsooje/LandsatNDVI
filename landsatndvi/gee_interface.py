@@ -73,3 +73,22 @@ def getTaskStatus():
     
     print(tasks_df['state'].value_counts())
     return tasks_df
+
+
+def submitTask(featureCollection, saveFolder, description):
+    """
+    Submits an Earth Engine task to export a FeatureCollection to Google Drive as a CSV file.
+
+    Parameters:
+        featureCollection (ee.FeatureCollection): The data to export.
+        saveFolder (str): The name of the folder in Google Drive where the file will be saved.
+        description (str): A description for the export task (used as the filename)
+    """
+    task_config = {
+        'collection': featureCollection,
+        'description': description,
+        'fileFormat': 'CSV',
+        'folder': saveFolder
+    }
+    task = ee.batch.Export.table.toDrive(**task_config)
+    task.start()
